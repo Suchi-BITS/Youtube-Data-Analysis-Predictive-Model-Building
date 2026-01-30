@@ -1,3 +1,0 @@
-- rolling_7d_views
-- rolling_30d_engagement
-- publish_hour
