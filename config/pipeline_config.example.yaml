@@ -1,0 +1,203 @@
+pipeline:
+  name: youtube-analytics-pipeline
+  version: 1.0.0
+  description: End-to-end YouTube analytics and predictive platform
+
+ingestion:
+  source:
+    type: kaggle_dataset
+    dataset_name: youtube-trending-videos
+    file_format: csv
+  validation:
+    schema_check: true
+    null_check: true
+    duplicate_check: true
+  batch_size: 10000
+  retry_policy:
+    max_attempts: 3
+    backoff_multiplier: 2
+
+etl:
+  bronze_to_silver:
+    transformations:
+      - type: data_cleaning
+        remove_duplicates: true
+        handle_nulls: fill
+        standardize_datatypes: true
+      - type: data_validation
+        schema_enforcement: true
+        quality_checks: true
+    partitions:
+      - column: publish_date
+        format: YYYY-MM-DD
+      - column: category_id
+  
+  silver_to_gold:
+    aggregations:
+      - name: daily_metrics
+        group_by: [publish_date, channel_id]
+        metrics: [total_views, avg_engagement_rate, video_count]
+      - name: category_performance
+        group_by: [category_id, publish_date]
+        metrics: [avg_views, avg_likes, avg_comments]
+      - name: channel_growth
+        group_by: [channel_id]
+        window: 30d
+        metrics: [view_growth_rate, subscriber_growth_rate]
+    
+    derived_features:
+      - engagement_rate: (likes + comments) / views
+      - like_ratio: likes / (likes + dislikes)
+      - comment_ratio: comments / views
+      - viral_score: (views * engagement_rate) / days_since_publish
+
+analytics:
+  athena:
+    database: youtube_analytics_db
+    tables:
+      - name: video_metrics
+        location: s3://curated/video_metrics/
+        format: parquet
+        partition_keys: [year, month, category_id]
+      - name: channel_performance
+        location: s3://curated/channel_performance/
+        format: parquet
+        partition_keys: [year, month]
+      - name: trending_analysis
+        location: s3://curated/trending_analysis/
+        format: parquet
+        partition_keys: [year, month]
+  
+  quicksight:
+    dashboards:
+      - name: channel_overview
+        visuals: [kpi_cards, line_charts, bar_charts]
+      - name: video_performance
+        visuals: [scatter_plots, heatmaps, trend_lines]
+      - name: engagement_trends
+        visuals: [time_series, distribution_charts]
+
+feature_engineering:
+  video_features:
+    - publish_hour
+    - publish_day_of_week
+    - title_length
+    - description_length
+    - tag_count
+    - days_since_channel_creation
+  
+  engagement_features:
+    - rolling_avg_views_7d
+    - rolling_avg_likes_7d
+    - rolling_avg_comments_7d
+    - engagement_growth_rate
+    - viral_coefficient
+  
+  temporal_features:
+    - hour_of_day
+    - day_of_week
+    - week_of_year
+    - is_weekend
+    - is_holiday
+
+machine_learning:
+  models:
+    - name: video_performance_predictor
+      type: regression
+      algorithms: [xgboost, random_forest, gradient_boosting]
+      target_variable: views
+      features: all_engineered_features
+      evaluation_metrics: [rmse, mae, r2_score]
+      hyperparameter_tuning: true
+    
+    - name: engagement_classifier
+      type: classification
+      algorithms: [logistic_regression, xgboost, neural_network]
+      target_variable: high_engagement
+      threshold: 0.05
+      evaluation_metrics: [accuracy, precision, recall, f1_score, auc_roc]
+    
+    - name: optimal_posting_recommender
+      type: recommendation
+      approach: collaborative_filtering
+      features: [publish_hour, day_of_week, category_id, historical_performance]
+      output: recommended_posting_times
+
+  training:
+    train_test_split: 0.8
+    validation_split: 0.1
+    cross_validation_folds: 5
+    random_state: 42
+  
+  deployment:
+    model_registry: sagemaker
+    endpoint_config:
+      instance_type: ml.m5.large
+      initial_instance_count: 1
+      auto_scaling:
+        min_instances: 1
+        max_instances: 5
+        target_metric: cpu_utilization
+        target_value: 70
+
+monitoring:
+  data_quality:
+    freshness_check: true
+    completeness_check: true
+    accuracy_check: true
+    consistency_check: true
+  
+  model_performance:
+    prediction_accuracy_threshold: 0.85
+    drift_detection: true
+    retraining_trigger:
+      performance_degradation: 0.1
+      data_drift_score: 0.3
+  
+  alerts:
+    - type: pipeline_failure
+      notification: sns
+      severity: high
+    - type: data_quality_issue
+      notification: sns
+      severity: medium
+    - type: model_drift
+      notification: sns
+      severity: high
+
+orchestration:
+  workflow_type: step_functions
+  schedules:
+    - name: daily_ingestion
+      cron: "0 2 * * ? *"
+      tasks: [ingest_data, validate_data]
+    - name: weekly_etl
+      cron: "0 3 * * 0 *"
+      tasks: [bronze_to_silver, silver_to_gold, update_catalog]
+    - name: monthly_model_training
+      cron: "0 4 1 * ? *"
+      tasks: [extract_features, train_models, evaluate_models, deploy_models]
+  
+  retry_strategy:
+    max_attempts: 3
+    interval_seconds: 60
+    backoff_rate: 2.0
+
+security:
+  encryption:
+    s3_bucket_encryption: AES256
+    data_at_rest: true
+    data_in_transit: true
+  
+  access_control:
+    iam_roles:
+      - glue_etl_role
+      - lambda_execution_role
+      - step_functions_role
+      - sagemaker_execution_role
+    least_privilege: true
+  
+  compliance:
+    data_retention_days: 365
+    audit_logging: true
+    sensitive_data_masking: true
