@@ -1,0 +1,14 @@
+aws:
+  region: us-east-1
+  raw_bucket: youtube-raw-data
+  processed_bucket: youtube-processed-data
+  curated_bucket: youtube-curated-data
+
+glue:
+  database: youtube_analytics
+  job_name: youtube_etl_job
+
+ml:
+  target_columns:
+    - views
+    - engagement_rate

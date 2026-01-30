@@ -1,0 +1,15 @@
+{
+  "StartAt": "Ingestion",
+  "States": {
+    "Ingestion": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ingestion",
+      "Next": "ETL"
+    },
+    "ETL": {
+      "Type": "Task",
+      "Resource": "arn:aws:glue:etl",
+      "End": true
+    }
+  }
+}
