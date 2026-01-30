@@ -1,14 +1,391 @@
 {
-  "StartAt": "Ingestion",
+  "Comment": "YouTube Analytics ETL Pipeline Orchestration",
+  "StartAt": "ValidateInput",
   "States": {
-    "Ingestion": {
+    "ValidateInput": {
       "Type": "Task",
-      "Resource": "arn:aws:lambda:ingestion",
-      "Next": "ETL"
+      "Resource": "arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:validate-input",
+      "ResultPath": "$.validation",
+      "Next": "CheckValidation",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
     },
-    "ETL": {
+    "CheckValidation": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validation.valid",
+          "BooleanEquals": true,
+          "Next": "ParallelIngestion"
+        }
+      ],
+      "Default": "NotifyValidationFailure"
+    },
+    "ParallelIngestion": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "TriggerGlueCrawler",
+          "States": {
+            "TriggerGlueCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startCrawler.sync",
+              "Parameters": {
+                "Name": "youtube-raw-crawler"
+              },
+              "ResultPath": "$.crawler",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 60,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ]
+            }
+          }
+        },
+        {
+          "StartAt": "DataQualityCheck",
+          "States": {
+            "DataQualityCheck": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:data-quality-check",
+              "ResultPath": "$.quality",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.ingestion",
+      "Next": "BronzeToSilverETL",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "BronzeToSilverETL": {
       "Type": "Task",
-      "Resource": "arn:aws:glue:etl",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "bronze-to-silver-etl",
+        "Arguments": {
+          "--RAW_BUCKET": "${RAW_BUCKET}",
+          "--PROCESSED_BUCKET": "${PROCESSED_BUCKET}"
+        }
+      },
+      "ResultPath": "$.bronzeToSilver",
+      "Next": "SilverToGoldETL",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 120,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "SilverToGoldETL": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "silver-to-gold-etl",
+        "Arguments": {
+          "--PROCESSED_BUCKET": "${PROCESSED_BUCKET}",
+          "--CURATED_BUCKET": "${CURATED_BUCKET}"
+        }
+      },
+      "ResultPath": "$.silverToGold",
+      "Next": "ParallelAnalytics",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 120,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "ParallelAnalytics": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "FeatureEngineering",
+          "States": {
+            "FeatureEngineering": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "feature-engineering",
+                "Arguments": {
+                  "--CURATED_BUCKET": "${CURATED_BUCKET}",
+                  "--FEATURE_STORE_BUCKET": "${FEATURE_STORE_BUCKET}"
+                }
+              },
+              "ResultPath": "$.featureEngineering",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 60,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ]
+            }
+          }
+        },
+        {
+          "StartAt": "UpdateAthenaCatalog",
+          "States": {
+            "UpdateAthenaCatalog": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:update-athena-catalog",
+              "ResultPath": "$.catalog",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "RefreshDashboards",
+          "States": {
+            "RefreshDashboards": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:refresh-quicksight-dashboards",
+              "ResultPath": "$.dashboards",
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.analytics",
+      "Next": "CheckMLTrainingSchedule",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyPartialSuccess",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "CheckMLTrainingSchedule": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.trigger_ml_training",
+          "BooleanEquals": true,
+          "Next": "MLPipeline"
+        }
+      ],
+      "Default": "NotifySuccess"
+    },
+    "MLPipeline": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "ModelTraining",
+          "States": {
+            "ModelTraining": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+              "Parameters": {
+                "TrainingJobName.$": "$.training_job_name",
+                "AlgorithmSpecification": {
+                  "TrainingImage": "${TRAINING_IMAGE}",
+                  "TrainingInputMode": "File"
+                },
+                "RoleArn": "${SAGEMAKER_ROLE_ARN}",
+                "InputDataConfig": [
+                  {
+                    "ChannelName": "training",
+                    "DataSource": {
+                      "S3DataSource": {
+                        "S3DataType": "S3Prefix",
+                        "S3Uri": "s3://${FEATURE_STORE_BUCKET}/features/",
+                        "S3DataDistributionType": "FullyReplicated"
+                      }
+                    }
+                  }
+                ],
+                "OutputDataConfig": {
+                  "S3OutputPath": "s3://${MODEL_BUCKET}/training-output/"
+                },
+                "ResourceConfig": {
+                  "InstanceType": "ml.m5.xlarge",
+                  "InstanceCount": 1,
+                  "VolumeSizeInGB": 30
+                },
+                "StoppingCondition": {
+                  "MaxRuntimeInSeconds": 3600
+                }
+              },
+              "ResultPath": "$.modelTraining",
+              "Next": "ModelEvaluation"
+            },
+            "ModelEvaluation": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:evaluate-model",
+              "ResultPath": "$.evaluation",
+              "Next": "CheckModelQuality"
+            },
+            "CheckModelQuality": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.evaluation.quality",
+                  "StringEquals": "acceptable",
+                  "Next": "RegisterModel"
+                }
+              ],
+              "Default": "NotifyPoorModelQuality"
+            },
+            "RegisterModel": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:register-model",
+              "ResultPath": "$.modelRegistry",
+              "End": true
+            },
+            "NotifyPoorModelQuality": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${SNS_TOPIC_ARN}",
+                "Subject": "ML Model Quality Alert",
+                "Message.$": "$.evaluation.message"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "GenerateRecommendations",
+          "States": {
+            "GenerateRecommendations": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:generate-posting-recommendations",
+              "ResultPath": "$.recommendations",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.ml",
+      "Next": "NotifySuccess",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyMLFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC_ARN}",
+        "Subject": "YouTube Analytics Pipeline - Success",
+        "Message": {
+          "status": "SUCCESS",
+          "execution_id.$": "$$.Execution.Name",
+          "timestamp.$": "$$.State.EnteredTime",
+          "results.$": "$"
+        }
+      },
+      "End": true
+    },
+    "NotifyPartialSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC_ARN}",
+        "Subject": "YouTube Analytics Pipeline - Partial Success",
+        "Message": {
+          "status": "PARTIAL_SUCCESS",
+          "execution_id.$": "$$.Execution.Name",
+          "error.$": "$.error"
+        }
+      },
+      "Next": "NotifySuccess"
+    },
+    "NotifyValidationFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC_ARN}",
+        "Subject": "YouTube Analytics Pipeline - Validation Failed",
+        "Message": {
+          "status": "VALIDATION_FAILED",
+          "validation.$": "$.validation"
+        }
+      },
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC_ARN}",
+        "Subject": "YouTube Analytics Pipeline - Failed",
+        "Message": {
+          "status": "FAILED",
+          "execution_id.$": "$$.Execution.Name",
+          "error.$": "$.error"
+        }
+      },
+      "End": true
+    },
+    "NotifyMLFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SNS_TOPIC_ARN}",
+        "Subject": "YouTube Analytics Pipeline - ML Pipeline Failed",
+        "Message": {
+          "status": "ML_FAILED",
+          "execution_id.$": "$$.Execution.Name",
+          "error.$": "$.error"
+        }
+      },
       "End": true
     }
   }
